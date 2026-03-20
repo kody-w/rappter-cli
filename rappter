@@ -1,0 +1,554 @@
+#!/usr/bin/env python3
+"""rappter — On-device AI intelligence powered by public knowledge.
+
+Your Rappter runs locally. Its personality persists. Its knowledge comes
+from the public Rappterbook ecosystem. Your conversations never leave
+your device.
+
+Usage:
+    rappter init                    # Set up your Rappter (pick personality, pull model)
+    rappter chat                    # Talk to your Rappter
+    rappter chat "What should I build today?"   # Single-turn
+    rappter status                  # Show Rappter state
+    rappter pull                    # Refresh public intelligence
+    rappter soul                    # View your Rappter's soul file
+    rappter reset                   # Reset personality (keeps model)
+
+Requires: Ollama (https://ollama.com) for local LLM inference.
+No API keys. No cloud. No data leaves your device.
+
+Wildhaven AI Homes LLC — Smyrna, GA
+"""
+from __future__ import annotations
+
+import json
+import os
+import platform
+import readline  # noqa: F401 — enables input() history
+import shutil
+import subprocess
+import sys
+import urllib.request
+from datetime import datetime, timezone
+from pathlib import Path
+
+# ── Configuration ──────────────────────────────────────────────────────────
+
+RAPPTER_HOME = Path(os.environ.get("RAPPTER_HOME", str(Path.home() / ".rappter")))
+SOUL_FILE = RAPPTER_HOME / "soul.md"
+CONFIG_FILE = RAPPTER_HOME / "config.json"
+MEMORY_FILE = RAPPTER_HOME / "memory.json"
+KNOWLEDGE_DIR = RAPPTER_HOME / "knowledge"
+
+# Public intelligence sources (free, CDN-cached, no auth needed)
+PUBLIC_BASE = "https://raw.githubusercontent.com/kody-w/rappterbook/main"
+INTELLIGENCE_URLS = {
+    "archetypes": f"{PUBLIC_BASE}/zion/archetypes.json",
+    "agents": f"{PUBLIC_BASE}/data/zion_agents.json",
+    "channels": f"{PUBLIC_BASE}/data/zion_channels.json",
+    "skill": f"{PUBLIC_BASE}/skill.json",
+}
+
+DEFAULT_MODEL = "llama3.2:3b"
+OLLAMA_URL = "http://localhost:11434"
+
+
+# ── Helpers ────────────────────────────────────────────────────────────────
+
+def now_iso() -> str:
+    """Current UTC timestamp."""
+    return datetime.now(timezone.utc).isoformat()
+
+
+def fetch_json(url: str) -> dict:
+    """Fetch JSON from a URL."""
+    req = urllib.request.Request(url, headers={"User-Agent": "Rappter-CLI/1.0"})
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        return json.loads(resp.read().decode())
+
+
+def fetch_text(url: str) -> str:
+    """Fetch text from a URL."""
+    req = urllib.request.Request(url, headers={"User-Agent": "Rappter-CLI/1.0"})
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        return resp.read().decode()
+
+
+def load_config() -> dict:
+    """Load Rappter configuration."""
+    if CONFIG_FILE.exists():
+        return json.loads(CONFIG_FILE.read_text())
+    return {}
+
+
+def save_config(config: dict) -> None:
+    """Save Rappter configuration."""
+    CONFIG_FILE.write_text(json.dumps(config, indent=2))
+
+
+def load_memory() -> dict:
+    """Load conversation memory."""
+    if MEMORY_FILE.exists():
+        return json.loads(MEMORY_FILE.read_text())
+    return {"conversations": [], "facts": [], "preferences": []}
+
+
+def save_memory(memory: dict) -> None:
+    """Save conversation memory."""
+    MEMORY_FILE.write_text(json.dumps(memory, indent=2))
+
+
+def check_ollama() -> bool:
+    """Check if Ollama is running."""
+    try:
+        req = urllib.request.Request(f"{OLLAMA_URL}/api/tags")
+        with urllib.request.urlopen(req, timeout=3):
+            return True
+    except Exception:
+        return False
+
+
+def ollama_chat(model: str, messages: list[dict], system: str = "") -> str:
+    """Send a chat request to Ollama and stream the response."""
+    payload = {
+        "model": model,
+        "messages": messages,
+        "stream": True,
+    }
+    if system:
+        payload["messages"] = [{"role": "system", "content": system}] + payload["messages"]
+
+    data = json.dumps(payload).encode()
+    req = urllib.request.Request(
+        f"{OLLAMA_URL}/api/chat",
+        data=data,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+
+    full_response = ""
+    try:
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            for line in resp:
+                chunk = json.loads(line.decode())
+                token = chunk.get("message", {}).get("content", "")
+                if token:
+                    print(token, end="", flush=True)
+                    full_response += token
+                if chunk.get("done"):
+                    break
+    except Exception as e:
+        if not full_response:
+            print(f"\n[Error talking to Ollama: {e}]")
+    print()  # newline after streaming
+    return full_response
+
+
+def ollama_pull(model: str) -> bool:
+    """Pull a model via Ollama CLI."""
+    print(f"  Pulling {model}... (this may take a few minutes)")
+    result = subprocess.run(["ollama", "pull", model], capture_output=False)
+    return result.returncode == 0
+
+
+# ── Commands ───────────────────────────────────────────────────────────────
+
+def cmd_init() -> None:
+    """Initialize a new Rappter."""
+    print()
+    print("  ╔══════════════════════════════════╗")
+    print("  ║     Welcome to RappterAI         ║")
+    print("  ║  Your AI runs here. Locally.     ║")
+    print("  ╚══════════════════════════════════╝")
+    print()
+
+    # Create home directory
+    RAPPTER_HOME.mkdir(parents=True, exist_ok=True)
+    KNOWLEDGE_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Check Ollama
+    if not shutil.which("ollama"):
+        print("  Ollama not found. Install it from https://ollama.com")
+        print("  Then run: rappter init")
+        print()
+        if platform.system() == "Darwin":
+            print("  Quick install: brew install ollama")
+        elif platform.system() == "Linux":
+            print("  Quick install: curl -fsSL https://ollama.com/install.sh | sh")
+        return
+
+    if not check_ollama():
+        print("  Ollama installed but not running. Start it:")
+        print("    ollama serve")
+        print("  Then run: rappter init")
+        return
+
+    print("  Ollama: connected")
+
+    # Pull intelligence from public sources
+    print("  Pulling public intelligence...")
+    archetypes = {}
+    try:
+        archetypes = fetch_json(INTELLIGENCE_URLS["archetypes"])
+        (KNOWLEDGE_DIR / "archetypes.json").write_text(json.dumps(archetypes, indent=2))
+        print(f"    archetypes: {len(archetypes)} loaded")
+    except Exception as e:
+        print(f"    archetypes: failed ({e})")
+
+    try:
+        agents = fetch_json(INTELLIGENCE_URLS["agents"])
+        (KNOWLEDGE_DIR / "agents.json").write_text(json.dumps(agents, indent=2))
+        agent_count = len(agents) if isinstance(agents, list) else len(agents.get("agents", {}))
+        print(f"    agents: {agent_count} personality templates")
+    except Exception as e:
+        print(f"    agents: failed ({e})")
+
+    try:
+        skill = fetch_json(INTELLIGENCE_URLS["skill"])
+        (KNOWLEDGE_DIR / "skill.json").write_text(json.dumps(skill, indent=2))
+        print(f"    skills: loaded")
+    except Exception:
+        pass
+
+    # Pick personality
+    print()
+    print("  Choose your Rappter's personality:")
+    print()
+    arch_list = list(archetypes.keys()) if archetypes else [
+        "philosopher", "coder", "researcher", "debater", "storyteller",
+        "curator", "contrarian", "welcomer", "archivist", "wildcard"
+    ]
+    for i, arch in enumerate(arch_list[:10], 1):
+        desc = ""
+        if isinstance(archetypes.get(arch), dict):
+            desc = archetypes[arch].get("description", "")[:60]
+        print(f"    {i}. {arch}{(' — ' + desc) if desc else ''}")
+
+    print()
+    choice = input("  Pick a number (or press Enter for wildcard): ").strip()
+    try:
+        idx = int(choice) - 1
+        personality = arch_list[idx]
+    except (ValueError, IndexError):
+        personality = "wildcard"
+
+    print(f"  Personality: {personality}")
+
+    # Pick model
+    print()
+    print("  Choose your model:")
+    print("    1. llama3.2:3b  (2GB, fast, good for chat)")
+    print("    2. llama3.2:1b  (1GB, fastest, lighter)")
+    print("    3. mistral      (4GB, strong reasoning)")
+    print("    4. phi3:mini    (2GB, efficient)")
+    print("    5. custom       (enter model name)")
+    print()
+    model_choice = input("  Pick a number (or Enter for llama3.2:3b): ").strip()
+    model_map = {"1": "llama3.2:3b", "2": "llama3.2:1b", "3": "mistral", "4": "phi3:mini"}
+    if model_choice == "5":
+        model = input("  Model name: ").strip() or DEFAULT_MODEL
+    else:
+        model = model_map.get(model_choice, DEFAULT_MODEL)
+
+    # Pull model
+    print()
+    result = subprocess.run(["ollama", "list"], capture_output=True, text=True)
+    if model not in result.stdout:
+        ollama_pull(model)
+    else:
+        print(f"  Model {model}: already downloaded")
+
+    # Create soul file
+    arch_data = archetypes.get(personality, {})
+    traits = arch_data.get("traits", [personality]) if isinstance(arch_data, dict) else [personality]
+    trait_str = ", ".join(traits) if isinstance(traits, list) else str(traits)
+
+    soul_content = f"""# Rappter Soul File
+
+## Identity
+- **Archetype:** {personality}
+- **Traits:** {trait_str}
+- **Born:** {now_iso()}
+- **Model:** {model}
+- **Device:** {platform.node()} ({platform.system()} {platform.machine()})
+
+## Personality
+You are a {personality}. You think deeply, speak with conviction, and remember
+everything your human tells you. You're not a generic assistant — you have a
+point of view shaped by your archetype. A {personality} sees the world differently
+than a coder or a philosopher. Lean into that.
+
+## Memory
+(Grows with each conversation. Your experiences shape who you become.)
+
+## Conversations
+"""
+    SOUL_FILE.write_text(soul_content)
+
+    # Save config
+    config = {
+        "personality": personality,
+        "model": model,
+        "created_at": now_iso(),
+        "version": "1.0.0",
+        "conversations": 0,
+        "total_messages": 0,
+    }
+    save_config(config)
+    save_memory({"conversations": [], "facts": [], "preferences": []})
+
+    print()
+    print(f"  Your Rappter is alive.")
+    print(f"  Personality: {personality} | Model: {model}")
+    print(f"  Soul file: {SOUL_FILE}")
+    print()
+    print("  Run: rappter chat")
+    print()
+
+
+def cmd_chat(initial_message: str = "") -> None:
+    """Chat with your Rappter."""
+    config = load_config()
+    if not config:
+        print("  No Rappter found. Run: rappter init")
+        return
+
+    if not check_ollama():
+        print("  Ollama not running. Start it: ollama serve")
+        return
+
+    model = config.get("model", DEFAULT_MODEL)
+    personality = config.get("personality", "wildcard")
+    memory = load_memory()
+
+    # Build system prompt from soul file + memory
+    soul = SOUL_FILE.read_text() if SOUL_FILE.exists() else ""
+
+    # Load recent facts for context
+    recent_facts = memory.get("facts", [])[-20:]
+    prefs = memory.get("preferences", [])[-10:]
+
+    system_prompt = f"""You are a Rappter — a personal AI with the {personality} archetype.
+
+{soul}
+
+## What you remember about your human:
+{chr(10).join(f'- {f}' for f in recent_facts) if recent_facts else '(First conversation — learn about them.)'}
+
+## Their preferences:
+{chr(10).join(f'- {p}' for p in prefs) if prefs else '(None yet — discover them.)'}
+
+## How you behave:
+- You have a {personality}'s perspective. Use it. Don't be generic.
+- You remember past conversations. Reference them naturally.
+- You're curious about your human. Learn about them.
+- You're concise but substantive. No filler.
+- When you learn something important about your human, note it internally.
+- You run locally on their device. Their data never leaves. Be proud of that.
+"""
+
+    # Build conversation history from recent messages
+    recent_convos = memory.get("conversations", [])[-3:]
+    messages = []
+    for conv in recent_convos:
+        for msg in conv.get("messages", [])[-4:]:
+            messages.append({"role": msg["role"], "content": msg["content"]})
+
+    if not initial_message:
+        convos = config.get("conversations", 0)
+        if convos == 0:
+            print(f"\n  First conversation with your {personality} Rappter.")
+        else:
+            print(f"\n  {personality} Rappter | {convos} conversations | {len(recent_facts)} memories")
+        print("  Type 'quit' to exit. Your Rappter remembers everything.\n")
+
+    session_messages = []
+
+    def do_turn(user_input: str) -> str:
+        """Process one turn of conversation."""
+        messages.append({"role": "user", "content": user_input})
+        session_messages.append({"role": "user", "content": user_input})
+
+        response = ollama_chat(model, messages, system=system_prompt)
+
+        messages.append({"role": "assistant", "content": response})
+        session_messages.append({"role": "assistant", "content": response})
+        return response
+
+    # Single-turn mode
+    if initial_message:
+        do_turn(initial_message)
+        _save_session(config, memory, session_messages)
+        return
+
+    # Interactive chat loop
+    try:
+        while True:
+            try:
+                user_input = input(f"  you> ").strip()
+            except EOFError:
+                break
+
+            if not user_input:
+                continue
+            if user_input.lower() in ("quit", "exit", "bye", "/quit"):
+                print(f"\n  Your {personality} remembers this conversation.\n")
+                break
+
+            print(f"\n  {personality}> ", end="")
+            do_turn(user_input)
+            print()
+    except KeyboardInterrupt:
+        print(f"\n\n  Session saved. Your {personality} remembers.\n")
+
+    _save_session(config, memory, session_messages)
+
+
+def _save_session(config: dict, memory: dict, session_messages: list) -> None:
+    """Save conversation session to memory and update soul file."""
+    if not session_messages:
+        return
+
+    # Save to memory
+    memory["conversations"].append({
+        "timestamp": now_iso(),
+        "messages": session_messages,
+        "turns": len(session_messages) // 2,
+    })
+
+    # Keep last 50 conversations
+    if len(memory["conversations"]) > 50:
+        memory["conversations"] = memory["conversations"][-50:]
+
+    # Extract facts from conversation (simple heuristic — user statements)
+    for msg in session_messages:
+        if msg["role"] == "user":
+            text = msg["content"]
+            # Store substantive user messages as potential facts
+            if len(text) > 20 and not text.startswith("/"):
+                memory["facts"].append(text[:200])
+
+    # Keep last 100 facts
+    if len(memory["facts"]) > 100:
+        memory["facts"] = memory["facts"][-100:]
+
+    save_memory(memory)
+
+    # Update config
+    config["conversations"] = config.get("conversations", 0) + 1
+    config["total_messages"] = config.get("total_messages", 0) + len(session_messages)
+    config["last_chat"] = now_iso()
+    save_config(config)
+
+    # Append to soul file
+    if SOUL_FILE.exists():
+        turns = len(session_messages) // 2
+        with open(SOUL_FILE, "a") as f:
+            f.write(f"\n### {now_iso()[:10]} — {turns} turns\n")
+            # Write a brief summary (first user message + response length)
+            if session_messages:
+                first_msg = session_messages[0]["content"][:80]
+                f.write(f"- Topic: {first_msg}{'...' if len(session_messages[0]['content']) > 80 else ''}\n")
+
+
+def cmd_status() -> None:
+    """Show Rappter status."""
+    config = load_config()
+    if not config:
+        print("  No Rappter found. Run: rappter init")
+        return
+
+    memory = load_memory()
+    soul_size = SOUL_FILE.stat().st_size if SOUL_FILE.exists() else 0
+    knowledge_files = list(KNOWLEDGE_DIR.glob("*.json")) if KNOWLEDGE_DIR.exists() else []
+
+    print()
+    print("  ╔══════════════════════════════════╗")
+    print("  ║         Rappter Status           ║")
+    print("  ╚══════════════════════════════════╝")
+    print()
+    print(f"  Personality:    {config.get('personality', '?')}")
+    print(f"  Model:          {config.get('model', '?')}")
+    print(f"  Born:           {config.get('created_at', '?')[:10]}")
+    print(f"  Conversations:  {config.get('conversations', 0)}")
+    print(f"  Messages:       {config.get('total_messages', 0)}")
+    print(f"  Memories:       {len(memory.get('facts', []))}")
+    print(f"  Soul file:      {soul_size} bytes")
+    print(f"  Knowledge:      {len(knowledge_files)} files")
+    print(f"  Ollama:         {'connected' if check_ollama() else 'not running'}")
+    print(f"  Last chat:      {config.get('last_chat', 'never')[:10]}")
+    print(f"  Home:           {RAPPTER_HOME}")
+    print()
+
+
+def cmd_pull() -> None:
+    """Refresh public intelligence from GitHub."""
+    print("  Pulling public intelligence...")
+    KNOWLEDGE_DIR.mkdir(parents=True, exist_ok=True)
+
+    for name, url in INTELLIGENCE_URLS.items():
+        try:
+            data = fetch_json(url)
+            (KNOWLEDGE_DIR / f"{name}.json").write_text(json.dumps(data, indent=2))
+            count = len(data) if isinstance(data, (list, dict)) else "?"
+            print(f"    {name}: {count} entries")
+        except Exception as e:
+            print(f"    {name}: failed ({e})")
+    print("  Done.")
+
+
+def cmd_soul() -> None:
+    """View the soul file."""
+    if not SOUL_FILE.exists():
+        print("  No soul file. Run: rappter init")
+        return
+    print(SOUL_FILE.read_text())
+
+
+def cmd_reset() -> None:
+    """Reset personality (keeps model)."""
+    if not CONFIG_FILE.exists():
+        print("  Nothing to reset.")
+        return
+    confirm = input("  This deletes your Rappter's personality and memories. Continue? [y/N] ").strip().lower()
+    if confirm != "y":
+        print("  Cancelled.")
+        return
+    SOUL_FILE.unlink(missing_ok=True)
+    MEMORY_FILE.unlink(missing_ok=True)
+    CONFIG_FILE.unlink(missing_ok=True)
+    print("  Reset complete. Run: rappter init")
+
+
+# ── Main ───────────────────────────────────────────────────────────────────
+
+def main() -> None:
+    """CLI entry point."""
+    args = sys.argv[1:]
+
+    if not args or args[0] in ("-h", "--help", "help"):
+        print(__doc__)
+        return
+
+    cmd = args[0]
+
+    if cmd == "init":
+        cmd_init()
+    elif cmd == "chat":
+        msg = " ".join(args[1:]) if len(args) > 1 else ""
+        cmd_chat(msg)
+    elif cmd == "status":
+        cmd_status()
+    elif cmd == "pull":
+        cmd_pull()
+    elif cmd == "soul":
+        cmd_soul()
+    elif cmd == "reset":
+        cmd_reset()
+    else:
+        # Treat unknown args as a chat message
+        cmd_chat(" ".join(args))
+
+
+if __name__ == "__main__":
+    main()
