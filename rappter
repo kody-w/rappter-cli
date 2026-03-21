@@ -12,10 +12,10 @@ Usage:
     rappter status                  # Show Rappter state
     rappter pull                    # Refresh public intelligence
     rappter soul                    # View your Rappter's soul file
-    rappter export                  # Backup full Rappter (soul + memory + config → .zip)
+    rappter egg                     # Lay an egg — full portable identity (→ rappter_egg.zip)
+    rappter hatch egg.zip           # Hatch an egg — restore AI on any device
     rappter export-transcripts      # Export conversations only (→ .json)
-    rappter import backup.zip       # Restore from backup
-    rappter import transcripts.json # Import conversation transcripts
+    rappter import-transcripts t.json # Import conversation transcripts
     rappter reset                   # Reset personality (keeps model)
 
 Requires: Ollama (https://ollama.com) for local LLM inference.
@@ -524,8 +524,13 @@ def cmd_reset() -> None:
     print("  Reset complete. Run: rappter init")
 
 
-def cmd_export(path: str = "") -> None:
-    """Export full Rappter backup (soul + config + memory + knowledge)."""
+def cmd_egg(path: str = "") -> None:
+    """Export a Rappter Egg — the entire AI identity in one portable file.
+
+    Creates rappter.json (full state) → compresses to rappter_egg.zip.
+    Sneakernet-portable: USB, AirDrop, email, carrier pigeon.
+    Import on any device with: rappter hatch rappter_egg.zip
+    """
     import zipfile
 
     config = load_config()
@@ -533,36 +538,153 @@ def cmd_export(path: str = "") -> None:
         print("  No Rappter found. Run: rappter init")
         return
 
+    memory = load_memory()
     agent_id = config.get("agent_id", "rappter")
+    agent_name = config.get("agent_name", agent_id)
+
+    # Build the single rappter.json — the ENTIRE identity
+    egg_data = {
+        "_format": "rappter_egg",
+        "_version": "1.0",
+        "_created": now_iso(),
+        "_agent_id": agent_id,
+        "_agent_name": agent_name,
+        "config": config,
+        "soul": SOUL_FILE.read_text() if SOUL_FILE.exists() else "",
+        "founding_soul": (RAPPTER_HOME / "founding_soul.md").read_text() if (RAPPTER_HOME / "founding_soul.md").exists() else "",
+        "memory": memory,
+        "knowledge": {},
+    }
+
+    # Include all knowledge files
+    if KNOWLEDGE_DIR.exists():
+        for f in KNOWLEDGE_DIR.glob("*.json"):
+            try:
+                egg_data["knowledge"][f.stem] = json.loads(f.read_text())
+            except Exception:
+                egg_data["knowledge"][f.stem] = f.read_text()
+
+    # Write rappter.json
+    json_path = RAPPTER_HOME / "rappter.json"
+    json_path.write_text(json.dumps(egg_data, indent=2))
+
+    # Compress to egg
     ts = now_iso()[:10]
-    out_name = path or f"rappter-backup-{agent_id}-{ts}.zip"
+    out_name = path or f"rappter_egg_{agent_id}_{ts}.zip"
 
     with zipfile.ZipFile(out_name, "w", zipfile.ZIP_DEFLATED) as zf:
-        # Soul file
-        if SOUL_FILE.exists():
-            zf.write(SOUL_FILE, "soul.md")
-
-        # Config
-        if CONFIG_FILE.exists():
-            zf.write(CONFIG_FILE, "config.json")
-
-        # Memory (includes conversation history + facts)
-        if MEMORY_FILE.exists():
-            zf.write(MEMORY_FILE, "memory.json")
-
-        # Knowledge files
-        if KNOWLEDGE_DIR.exists():
-            for f in KNOWLEDGE_DIR.glob("*.json"):
-                zf.write(f, f"knowledge/{f.name}")
-
-        # Founding soul (if exists)
-        founding = RAPPTER_HOME / "founding_soul.md"
-        if founding.exists():
-            zf.write(founding, "founding_soul.md")
+        zf.write(json_path, "rappter.json")
 
     size_kb = Path(out_name).stat().st_size // 1024
-    print(f"  Exported: {out_name} ({size_kb}KB)")
-    print(f"  Contains: soul, config, memory, knowledge, founding soul")
+    convos = len(memory.get("conversations", []))
+    facts = len(memory.get("facts", []))
+    soul_kb = len(egg_data["soul"]) // 1024
+
+    print()
+    print(f"  ╔══════════════════════════════════╗")
+    print(f"  ║        RAPPTER EGG LAID          ║")
+    print(f"  ╚══════════════════════════════════╝")
+    print()
+    print(f"  Agent:         {agent_name} ({agent_id})")
+    print(f"  Soul:          {soul_kb}KB")
+    print(f"  Conversations: {convos}")
+    print(f"  Memories:      {facts}")
+    print(f"  Egg:           {out_name} ({size_kb}KB)")
+    print()
+    print(f"  Transfer this file to any device.")
+    print(f"  Hatch with: rappter hatch {out_name}")
+    print()
+
+
+def cmd_hatch(path: str) -> None:
+    """Hatch a Rappter Egg — restore a full AI identity from a portable file.
+
+    Decompresses rappter_egg.zip → reads rappter.json → rebuilds everything.
+    The Rappter lives again on a new device, memories intact.
+    """
+    import zipfile
+
+    if not path:
+        print("  Usage: rappter hatch <rappter_egg.zip>")
+        return
+
+    p = Path(path)
+    if not p.exists():
+        print(f"  File not found: {path}")
+        return
+
+    # Handle both .zip eggs and raw .json
+    if p.suffix == ".zip":
+        with zipfile.ZipFile(path, "r") as zf:
+            if "rappter.json" not in zf.namelist():
+                print("  Not a valid Rappter Egg (no rappter.json inside)")
+                return
+            egg_data = json.loads(zf.read("rappter.json").decode())
+    elif p.suffix == ".json":
+        egg_data = json.loads(p.read_text())
+    else:
+        print("  Expected .zip (egg) or .json (raw identity)")
+        return
+
+    if egg_data.get("_format") != "rappter_egg":
+        print("  Not a valid Rappter Egg format")
+        return
+
+    agent_id = egg_data.get("_agent_id", "unknown")
+    agent_name = egg_data.get("_agent_name", agent_id)
+
+    print()
+    print(f"  ╔══════════════════════════════════╗")
+    print(f"  ║       HATCHING RAPPTER EGG       ║")
+    print(f"  ╚══════════════════════════════════╝")
+    print()
+    print(f"  Agent: {agent_name} ({agent_id})")
+
+    RAPPTER_HOME.mkdir(parents=True, exist_ok=True)
+    KNOWLEDGE_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Restore config
+    if egg_data.get("config"):
+        save_config(egg_data["config"])
+        print(f"  Config:  restored")
+
+    # Restore soul
+    if egg_data.get("soul"):
+        SOUL_FILE.write_text(egg_data["soul"])
+        print(f"  Soul:    {len(egg_data['soul']) // 1024}KB restored")
+
+    # Restore founding soul
+    if egg_data.get("founding_soul"):
+        (RAPPTER_HOME / "founding_soul.md").write_text(egg_data["founding_soul"])
+        print(f"  Origin:  founding soul restored")
+
+    # Restore memory
+    if egg_data.get("memory"):
+        save_memory(egg_data["memory"])
+        convos = len(egg_data["memory"].get("conversations", []))
+        facts = len(egg_data["memory"].get("facts", []))
+        print(f"  Memory:  {convos} conversations, {facts} memories")
+
+    # Restore knowledge
+    for name, data in egg_data.get("knowledge", {}).items():
+        kfile = KNOWLEDGE_DIR / f"{name}.json"
+        if isinstance(data, (dict, list)):
+            kfile.write_text(json.dumps(data, indent=2))
+        else:
+            kfile.write_text(str(data))
+    kcount = len(egg_data.get("knowledge", {}))
+    if kcount:
+        print(f"  Knowledge: {kcount} files")
+
+    print()
+    print(f"  {agent_name} has hatched.")
+    print(f"  Home: {RAPPTER_HOME}")
+    print()
+    print(f"  Next: ensure Ollama is running with the right model:")
+    model = egg_data.get("config", {}).get("model", "llama3.1:8b")
+    print(f"    ollama pull {model}")
+    print(f"    rappter chat")
+    print()
 
 
 def cmd_export_transcripts(path: str = "") -> None:
@@ -574,12 +696,15 @@ def cmd_export_transcripts(path: str = "") -> None:
         return
 
     agent_id = config.get("agent_id", "rappter")
+    agent_name = config.get("agent_name", agent_id)
     ts = now_iso()[:10]
-    out_name = path or f"rappter-transcripts-{agent_id}-{ts}.json"
+    out_name = path or f"rappter_transcripts_{agent_id}_{ts}.json"
 
     transcripts = {
+        "_format": "rappter_transcripts",
+        "_version": "1.0",
         "agent_id": agent_id,
-        "agent_name": config.get("agent_name", ""),
+        "agent_name": agent_name,
         "exported_at": now_iso(),
         "total_conversations": len(memory.get("conversations", [])),
         "total_facts": len(memory.get("facts", [])),
@@ -594,12 +719,10 @@ def cmd_export_transcripts(path: str = "") -> None:
     print(f"  Exported: {out_name} ({size_kb}KB, {convos} conversations)")
 
 
-def cmd_import(path: str) -> None:
-    """Import a Rappter backup (restores soul + config + memory + knowledge)."""
-    import zipfile
-
+def cmd_import_transcripts(path: str) -> None:
+    """Import conversation transcripts into current Rappter."""
     if not path:
-        print("  Usage: rappter import <backup.zip>")
+        print("  Usage: rappter import-transcripts <transcripts.json>")
         return
 
     p = Path(path)
@@ -607,41 +730,18 @@ def cmd_import(path: str) -> None:
         print(f"  File not found: {path}")
         return
 
-    if p.suffix == ".json":
-        # Import transcripts only
-        data = json.loads(p.read_text())
-        if "conversations" in data:
-            memory = load_memory()
-            imported = data["conversations"]
-            memory["conversations"].extend(imported)
-            memory["facts"].extend(data.get("facts", []))
-            memory["preferences"].extend(data.get("preferences", []))
-            save_memory(memory)
-            print(f"  Imported {len(imported)} conversations into memory")
-            return
+    data = json.loads(p.read_text())
+    if "conversations" not in data:
         print("  Not a valid transcript file")
         return
 
-    if p.suffix != ".zip":
-        print("  Expected .zip (full backup) or .json (transcripts)")
-        return
-
-    RAPPTER_HOME.mkdir(parents=True, exist_ok=True)
-
-    with zipfile.ZipFile(path, "r") as zf:
-        members = zf.namelist()
-        for member in members:
-            target = RAPPTER_HOME / member
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(zf.read(member))
-
-    print(f"  Imported from {path}:")
-    print(f"    Files: {', '.join(members)}")
-    config = load_config()
-    if config:
-        print(f"    Agent: {config.get('agent_id', '?')} ({config.get('agent_name', '?')})")
-    print(f"    Home: {RAPPTER_HOME}")
-    print(f"  Run: rappter chat")
+    memory = load_memory()
+    imported = data["conversations"]
+    memory["conversations"].extend(imported)
+    memory["facts"].extend(data.get("facts", []))
+    memory["preferences"].extend(data.get("preferences", []))
+    save_memory(memory)
+    print(f"  Imported {len(imported)} conversations into memory")
 
 
 # ── Main ───────────────────────────────────────────────────────────────────
@@ -669,15 +769,18 @@ def main() -> None:
         cmd_soul()
     elif cmd == "reset":
         cmd_reset()
-    elif cmd == "export":
+    elif cmd == "egg":
         path = args[1] if len(args) > 1 else ""
-        cmd_export(path)
+        cmd_egg(path)
+    elif cmd == "hatch":
+        path = args[1] if len(args) > 1 else ""
+        cmd_hatch(path)
     elif cmd == "export-transcripts":
         path = args[1] if len(args) > 1 else ""
         cmd_export_transcripts(path)
-    elif cmd == "import":
+    elif cmd == "import-transcripts":
         path = args[1] if len(args) > 1 else ""
-        cmd_import(path)
+        cmd_import_transcripts(path)
     else:
         # Treat unknown args as a chat message
         cmd_chat(" ".join(args))
