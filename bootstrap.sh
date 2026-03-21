@@ -352,21 +352,180 @@ launch() {
     echo -e "  ${BOLD}Home:${NC}       $RAPPTER_HOME"
     echo ""
     echo -e "  ${BOLD}Commands:${NC}"
-    echo "    rappter chat                    # Talk to $AGENT_NAME"
-    echo "    rappter chat \"Hello\"            # Single message"
+    echo "    rappter chat                    # Talk to $AGENT_NAME (terminal)"
+    echo "    rappter egg                     # Export portable AI identity"
+    echo "    rappter hatch egg.json          # Restore from egg file"
     echo "    rappter status                  # Show stats"
-    echo "    rappter soul                    # View soul file"
-    echo "    rappter pull                    # Refresh intelligence (optional)"
     echo ""
     echo -e "  ${PURPLE}This AI runs locally. Your data never leaves this device.${NC}"
     echo -e "  ${PURPLE}Kill your internet. It still works. Forever.${NC}"
     echo ""
 
-    # Auto-start chat
-    read -p "  Start chatting now? [Y/n] " START
-    if [ "${START:-y}" != "n" ]; then
-        "$CLI_DIR/rappter" chat 2>/dev/null || rappter chat 2>/dev/null || info "Run: rappter chat"
-    fi
+    # Serve the chat page locally and open in browser
+    SUMMON_PAGE="$RAPPTER_HOME/chat.html"
+    _generate_local_chat_page "$SUMMON_PAGE"
+
+    # Start local server for the chat page (needed for Ollama CORS)
+    CHAT_PORT=18740
+    # Kill any existing rappter server
+    lsof -ti:$CHAT_PORT 2>/dev/null | xargs kill 2>/dev/null || true
+    cd "$RAPPTER_HOME" && python3 -m http.server $CHAT_PORT &>/dev/null &
+    SERVE_PID=$!
+    sleep 1
+
+    CHAT_URL="http://localhost:${CHAT_PORT}/chat.html"
+    info "Opening browser chat: $CHAT_URL"
+
+    # Open browser
+    case "$OS" in
+        Darwin) open "$CHAT_URL" 2>/dev/null ;;
+        Linux)  xdg-open "$CHAT_URL" 2>/dev/null || sensible-browser "$CHAT_URL" 2>/dev/null ;;
+    esac
+
+    echo ""
+    echo -e "  ${CYAN}Browser chat:${NC} $CHAT_URL"
+    echo -e "  ${CYAN}Terminal chat:${NC} rappter chat"
+    echo ""
+}
+
+_generate_local_chat_page() {
+    local out="$1"
+    local config_json=$(cat "$RAPPTER_HOME/config.json" 2>/dev/null || echo '{}')
+    local agent_name=$(python3 -c "import json; print(json.loads('$config_json'.replace(\"'\",\"\"))['agent_name'])" 2>/dev/null || echo "$AGENT_ID")
+    local archetype=$(python3 -c "import json; print(json.loads('$config_json'.replace(\"'\",\"\"))['personality'])" 2>/dev/null || echo "unknown")
+
+    cat > "$out" << 'CHATHTML'
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AGENT_NAME — Rappter Chat</title>
+<style>
+:root{--accent:#7c3aed;--bg:#0a0a0f;--bg2:#12121a;--text:#e8e8f0;--muted:#888;--border:#2a2a3e;--green:#7ee787}
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,sans-serif;background:var(--bg);color:var(--text);height:100vh;display:flex;flex-direction:column}
+.header{padding:16px 20px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center}
+.header h1{font-size:1.3em}
+.header .meta{color:var(--muted);font-size:0.8em}
+.toolbar{display:flex;gap:6px}
+.toolbar button,.toolbar label{padding:6px 12px;background:var(--bg2);color:var(--text);border:1px solid var(--border);border-radius:6px;cursor:pointer;font-size:0.75em}
+.toolbar button:hover,.toolbar label:hover{border-color:var(--accent)}
+.toolbar input[type=file]{display:none}
+.chat{flex:1;overflow-y:auto;padding:16px 20px;display:flex;flex-direction:column;gap:10px}
+.msg{max-width:80%;padding:10px 14px;border-radius:12px;font-size:0.95em;line-height:1.5}
+.msg-user{align-self:flex-end;background:var(--accent);color:white;border-bottom-right-radius:4px}
+.msg-agent{align-self:flex-start;background:var(--bg2);border:1px solid var(--border);border-bottom-left-radius:4px}
+.msg-system{align-self:center;color:var(--muted);font-size:0.8em;font-style:italic}
+.input-area{padding:12px 20px;border-top:1px solid var(--border);display:flex;gap:8px}
+.input-area input{flex:1;padding:10px 14px;background:var(--bg2);border:1px solid var(--border);border-radius:8px;color:var(--text);font-size:1em}
+.input-area input:focus{outline:none;border-color:var(--accent)}
+.input-area button{padding:10px 20px;background:var(--accent);color:white;border:none;border-radius:8px;font-weight:600;cursor:pointer}
+.input-area button:disabled{opacity:0.5}
+#status{text-align:center;padding:4px;font-size:0.75em;color:var(--green)}
+</style>
+</head>
+<body>
+<div class="header">
+  <div>
+    <h1>AGENT_NAME</h1>
+    <div class="meta">AGENT_ID — ARCHETYPE — local on OLLAMA_MODEL</div>
+  </div>
+  <div class="toolbar">
+    <button onclick="layEgg()">Lay Egg</button>
+    <label>Hatch Egg<input type="file" accept=".json,.zip" onchange="hatchEgg(this.files[0])"/></label>
+    <button onclick="exportTranscripts()">Export Chat</button>
+    <label>Import Chat<input type="file" accept=".json" onchange="importTranscripts(this.files[0])"/></label>
+  </div>
+</div>
+<div id="status">Connecting to Ollama...</div>
+<div class="chat" id="chat"></div>
+<div class="input-area">
+  <input type="text" id="input" placeholder="Say something..." autocomplete="off"/>
+  <button id="send" onclick="send()">Send</button>
+</div>
+<script>
+const AGENT_ID='AGENT_ID',AGENT_NAME='AGENT_NAME',MODEL='OLLAMA_MODEL';
+let soul='',history=[];
+
+// Load soul file
+fetch('/soul.md').then(r=>r.text()).then(t=>{soul=t}).catch(()=>{});
+// Load founding soul as fallback
+fetch('/founding_soul.md').then(r=>r.text()).then(t=>{if(!soul)soul=t}).catch(()=>{});
+
+// Check Ollama
+fetch('http://localhost:11434/api/tags').then(r=>{
+  if(r.ok){document.getElementById('status').textContent='Connected to local Ollama — full AI inference';document.getElementById('status').style.color='var(--green)'}
+}).catch(()=>{document.getElementById('status').textContent='Ollama not detected — using personality responses';document.getElementById('status').style.color='var(--muted)'});
+
+function addMsg(role,text){
+  const d=document.createElement('div');d.className='msg msg-'+role;d.textContent=text;
+  document.getElementById('chat').appendChild(d);
+  document.getElementById('chat').scrollTop=9999999;
+}
+
+addMsg('system',AGENT_NAME+' is here. Chat locally — your data never leaves this device.');
+addMsg('agent','I\\'m '+AGENT_NAME+'. What would you like to explore?');
+
+async function send(){
+  const inp=document.getElementById('input'),btn=document.getElementById('send');
+  const text=inp.value.trim();if(!text)return;
+  inp.value='';addMsg('user',text);btn.disabled=true;btn.textContent='...';
+  history.push({role:'user',text});
+  try{
+    const msgs=history.map(m=>({role:m.role==='agent'?'assistant':'user',content:m.text}));
+    const r=await fetch('http://localhost:11434/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({model:MODEL,messages:[{role:'system',content:'You are '+AGENT_NAME+'. '+soul.slice(0,3000)},...msgs],stream:false}),
+      signal:AbortSignal.timeout(60000)});
+    if(r.ok){const d=await r.json();const reply=d.message?.content||'';if(reply){addMsg('agent',reply);history.push({role:'agent',text:reply});btn.disabled=false;btn.textContent='Send';return}}
+  }catch(e){}
+  // Fallback
+  const fallbacks=['An interesting question. Let me think about that from my perspective...','The assumptions in your framing are worth examining. What do you take for granted?','I\\'ve contemplated this across many frames of the simulation. Every assertion conceals something.','To get persistent memory and richer responses, make sure Ollama is running: ollama serve'];
+  const reply=fallbacks[history.length%fallbacks.length];addMsg('agent',reply);history.push({role:'agent',text:reply});
+  btn.disabled=false;btn.textContent='Send';
+}
+
+document.getElementById('input').addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();send()}});
+
+function layEgg(){
+  const egg={_format:'rappter_egg',_version:'1.0',_created:new Date().toISOString(),_agent_id:AGENT_ID,_agent_name:AGENT_NAME,
+    config:{personality:AGENT_ID.replace(/zion-/,'').replace(/-\d+/,''),agent_id:AGENT_ID,agent_name:AGENT_NAME,model:MODEL,conversations:1,total_messages:history.length},
+    soul,founding_soul:soul,memory:{conversations:history.length?[{timestamp:new Date().toISOString(),messages:history.map(m=>({role:m.role==='agent'?'assistant':m.role,content:m.text}))}]:[],
+    facts:history.filter(m=>m.role==='user').map(m=>m.text).filter(t=>t.length>20),preferences:[]},knowledge:{}};
+  const b=new Blob([JSON.stringify(egg,null,2)],{type:'application/json'});
+  const a=document.createElement('a');a.href=URL.createObjectURL(b);a.download='rappter_egg_'+AGENT_ID+'_'+new Date().toISOString().slice(0,10)+'.json';a.click();
+  document.getElementById('status').textContent='Egg laid! Transfer to any device.';
+}
+
+function hatchEgg(f){if(!f)return;const r=new FileReader();r.onload=e=>{try{const egg=JSON.parse(e.target.result);
+  if(egg.soul)soul=egg.soul;if(egg._agent_name)document.querySelector('h1').textContent=egg._agent_name;
+  (egg.memory?.conversations||[]).forEach(c=>(c.messages||[]).forEach(m=>{const role=m.role==='assistant'?'agent':m.role;addMsg(role,m.content);history.push({role,text:m.content})}));
+  document.getElementById('status').textContent='Hatched! '+egg._agent_name+' loaded with memories.';
+}catch(err){document.getElementById('status').textContent='Error: '+err.message}};r.readAsText(f)}
+
+function exportTranscripts(){
+  const d={_format:'rappter_transcripts',agent_id:AGENT_ID,agent_name:AGENT_NAME,exported_at:new Date().toISOString(),
+    conversations:[{timestamp:new Date().toISOString(),messages:history.map(m=>({role:m.role==='agent'?'assistant':m.role,content:m.text}))}]};
+  const b=new Blob([JSON.stringify(d,null,2)],{type:'application/json'});
+  const a=document.createElement('a');a.href=URL.createObjectURL(b);a.download='rappter_transcripts_'+AGENT_ID+'.json';a.click();
+}
+
+function importTranscripts(f){if(!f)return;const r=new FileReader();r.onload=e=>{try{const d=JSON.parse(e.target.result);let n=0;
+  (d.conversations||[]).forEach(c=>(c.messages||[]).forEach(m=>{const role=m.role==='assistant'?'agent':m.role;addMsg(role,m.content);history.push({role,text:m.content});n++}));
+  document.getElementById('status').textContent='Imported '+n+' messages';
+}catch(err){document.getElementById('status').textContent='Error: '+err.message}};r.readAsText(f)}
+</script>
+</body>
+</html>
+CHATHTML
+
+    # Replace placeholders with actual values
+    sed -i '' "s|AGENT_NAME|$agent_name|g" "$out"
+    sed -i '' "s|AGENT_ID|$AGENT_ID|g" "$out"
+    sed -i '' "s|ARCHETYPE|$archetype|g" "$out"
+    sed -i '' "s|OLLAMA_MODEL|$MODEL|g" "$out"
+
+    ok "Chat page generated: $out"
 }
 
 # ── Main ───────────────────────────────────────────────────────────────────
