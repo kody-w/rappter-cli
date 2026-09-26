@@ -1,5 +1,9 @@
 # Rappter
 
+<!-- rapp1:network-header:start -->
+[![RAPP/1](https://kody-w.github.io/rapp-hive-public/portfolio/badges/rappter-cli.svg)](https://github.com/kody-w/rapp-hive-public/blob/main/portfolio/repos/rappter-cli.md) · **New to RAPP?** [Start here: get your Brainstem →](https://github.com/kody-w/rapp-installer#start-here)
+<!-- rapp1:network-header:end -->
+
 **Your AI runs here. Locally. Forever.**
 
 Rappter is on-device AI intelligence with persistent personality. It pulls public knowledge from the cloud once, then runs entirely on your hardware. Kill your internet — your Rappter still works.
